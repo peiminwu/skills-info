@@ -1,0 +1,5 @@
+version: 1
+interface:
+  display_name: XHS Content Extractor
+  short_description: 抓取小红书图文并输出含图片OCR的TXT
+  default_prompt: 输入一个小红书图文链接，抓取正文并将每张图片OCR后按原顺序输出为txt。

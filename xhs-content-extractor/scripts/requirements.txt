@@ -1,0 +1,5 @@
+paddleocr>=2.8.1
+paddlepaddle>=2.6.2
+requests>=2.32.0
+selenium>=4.27.0
+Pillow>=10.0.0
