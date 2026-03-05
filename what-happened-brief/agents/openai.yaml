@@ -1,0 +1,4 @@
+interface:
+  display_name: "What Happened Brief"
+  short_description: "按时间截面生成平衡且可回查的事件综述"
+  default_prompt: "Use $what-happened-brief to produce a balanced Chinese brief, or add -极简 to return only a cause-focused summary in a .txt file."
