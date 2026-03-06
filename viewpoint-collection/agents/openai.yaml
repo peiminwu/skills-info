@@ -1,0 +1,4 @@
+interface:
+  display_name: "Viewpoint Collection"
+  short_description: "按 links 或白名单来源整理主题的多空与中性观点"
+  default_prompt: "Use $viewpoint-collection to summarize a topic from provided links, or fall back to the source whitelist and return a PPT-ready Chinese .txt with bullish, bearish, and neutral sections."
