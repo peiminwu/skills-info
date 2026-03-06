@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
+import hashlib
 import json
 import os
 import re
@@ -23,6 +25,9 @@ from PIL import Image
 DEFAULT_ENCODING = "utf-8-sig"
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_TIMEOUT_SEC = 30
+DEFAULT_DOWNLOAD_WORKERS = 4
+DEFAULT_OCR_MAX_SIDE = 1280
+DEFAULT_OCR_CPU_THREADS = 10
 
 # Avoid remote hoster probing on every run; speed up startup.
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
@@ -38,22 +43,57 @@ class NoteData:
     image_urls: list[str]
 
 
+@dataclass
+class SourceInput:
+    raw_text: str
+    url: str
+    share_hint: str
+
+
 def log(message: str) -> None:
     print(message, file=sys.stderr)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fetch a Xiaohongshu note and export OCR TXT.")
-    parser.add_argument("url", help="Xiaohongshu note URL")
+    parser.add_argument("source", help="Xiaohongshu URL or pasted share text")
     parser.add_argument("--out-dir", default="outputs", help="Output directory (default: outputs)")
     parser.add_argument("--encoding", default=DEFAULT_ENCODING, help="Output text encoding (default: utf-8-sig)")
     parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES, help="Retry times (default: 3)")
     parser.add_argument("--timeout-sec", type=int, default=DEFAULT_TIMEOUT_SEC, help="Timeout seconds (default: 30)")
+    parser.add_argument(
+        "--download-workers",
+        type=int,
+        default=DEFAULT_DOWNLOAD_WORKERS,
+        help="Concurrent image download workers (default: 4)",
+    )
+    parser.add_argument(
+        "--ocr-max-side",
+        type=int,
+        default=DEFAULT_OCR_MAX_SIDE,
+        help="Resize long image side before OCR; smaller is faster (default: 1280)",
+    )
+    parser.add_argument(
+        "--ocr-cpu-threads",
+        type=int,
+        default=DEFAULT_OCR_CPU_THREADS,
+        help="CPU threads for PaddleOCR inference (default: 10)",
+    )
+    parser.add_argument(
+        "--disable-ocr-cache",
+        action="store_true",
+        help="Disable persistent OCR cache",
+    )
     parser.add_argument("--show-browser", action="store_true", help="Show Safari window while running")
     parser.add_argument(
         "--use-active-tab",
         action="store_true",
         help="Reuse current Safari front tab session (no Selenium)",
+    )
+    parser.add_argument(
+        "--skip-share-verify",
+        action="store_true",
+        help="Skip early share-text verification before OCR",
     )
     return parser.parse_args()
 
@@ -65,6 +105,30 @@ def normalize_url(url: str) -> str:
     if not re.match(r"^https?://", url):
         url = "https://" + url
     return url
+
+
+def parse_source_input(source: str) -> SourceInput:
+    raw_text = (source or "").strip()
+    if not raw_text:
+        raise ValueError("URL is empty")
+
+    match = re.search(r"https?://[^\s]+", raw_text)
+    url = match.group(0) if match else raw_text
+    url = normalize_url(url)
+
+    share_hint = raw_text
+    if match:
+        share_hint = raw_text.replace(match.group(0), " ")
+    boilerplate_patterns = [
+        r"Copy and open Xiaohongshu to view the full post[!！]*",
+        r"打开小红书.*查看.*",
+        r"小红书，复制本条信息.*",
+        r"复制这条信息.*打开小红书.*",
+    ]
+    for pattern in boilerplate_patterns:
+        share_hint = re.sub(pattern, " ", share_hint, flags=re.IGNORECASE)
+    share_hint = re.sub(r"\s+", " ", share_hint).strip()
+    return SourceInput(raw_text=raw_text, url=url, share_hint=share_hint)
 
 
 def extract_note_id(url: str) -> str:
@@ -102,16 +166,11 @@ def clean_title(raw_title: str) -> str:
     return title
 
 
-def safe_filename(name: str, fallback: str) -> str:
-    cleaned = re.sub(r'[\\/:*?"<>]', " ", (name or "").strip())
-    cleaned = re.sub(r"\s+", " ", cleaned).strip().strip(".")
-    if not cleaned:
-        cleaned = fallback
-    if len(cleaned) > 100:
-        cleaned = cleaned[:100].rstrip()
-    if not (cleaned.startswith("《") and cleaned.endswith("》")):
-        cleaned = f"《{cleaned}》"
-    return cleaned
+def build_output_stem(note_id: str) -> str:
+    candidate = re.sub(r"[^A-Za-z0-9_-]+", "_", (note_id or "").strip()).strip("._")
+    if not candidate:
+        candidate = f"xhs_{int(time.time())}"
+    return candidate
 
 
 def looks_like_title(text: str) -> bool:
@@ -729,7 +788,7 @@ def run_ocr(ocr_engine: Any, image_path: Path) -> str:
                         lines.append(text_s)
         return compact_ocr_lines(lines)
 
-    result = ocr_engine.ocr(str(image_path), cls=True)
+    result = ocr_engine.ocr(str(image_path), cls=False)
     if not result:
         return ""
     for page_result in result:
@@ -830,7 +889,7 @@ def prepare_image_for_ocr(image_path: Path, max_side: int = 1280) -> Path:
             new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
             resized = img.resize(new_size, Image.Resampling.LANCZOS)
             ocr_path = image_path.with_name(f"{image_path.stem}_ocr.jpg")
-            resized.save(ocr_path, format="JPEG", quality=85, optimize=True)
+            resized.save(ocr_path, format="JPEG", quality=85)
             return ocr_path
     except Exception:  # noqa: BLE001
         return image_path
@@ -889,6 +948,48 @@ def normalize_for_compare(text: str) -> str:
     return re.sub(r"[\W_]+", "", text, flags=re.UNICODE).lower()
 
 
+def build_note_preview(note_data: NoteData, max_chars: int = 240) -> str:
+    parts: list[str] = []
+    if note_data.title:
+        parts.append(note_data.title.strip())
+    for block in note_data.blocks:
+        if block.get("type") != "text":
+            continue
+        text = (block.get("text") or "").strip()
+        if text:
+            parts.append(text)
+        if sum(len(x) for x in parts) >= max_chars:
+            break
+    return " ".join(parts)[:max_chars].strip()
+
+
+def verify_share_hint_matches_note(source_input: SourceInput, note_data: NoteData) -> None:
+    hint_norm = normalize_for_compare(source_input.share_hint)
+    if len(hint_norm) < 10:
+        return
+
+    note_preview = build_note_preview(note_data, max_chars=400)
+    note_norm = normalize_for_compare(note_preview)
+    if not note_norm:
+        return
+
+    title_norm = normalize_for_compare(note_data.title)
+    common = SequenceMatcher(None, hint_norm[:800], note_norm[:2000]).find_longest_match(
+        0, min(len(hint_norm), 800), 0, min(len(note_norm), 2000)
+    ).size
+    ratio = SequenceMatcher(None, hint_norm[:300], note_norm[:600]).ratio()
+    title_match = bool(title_norm) and title_norm in hint_norm
+
+    if title_match or common >= 12 or ratio >= 0.35:
+        return
+
+    raise RuntimeError(
+        "分享文本与实际页面不匹配，已在OCR前终止。"
+        f" 预览: {source_input.share_hint[:60]!r}"
+        f" 实际: {note_preview[:60]!r}"
+    )
+
+
 def is_duplicate_ocr_block(ocr_text: str, existing_text: str) -> bool:
     ocr_norm = normalize_for_compare(ocr_text)
     existing_norm = normalize_for_compare(existing_text)
@@ -921,6 +1022,71 @@ def ensure_paths(out_dir: Path, file_stem: str) -> tuple[Path, Path]:
     return txt_path, image_dir
 
 
+def ensure_ocr_cache_dir(out_dir: Path) -> Path:
+    cache_dir = out_dir / ".ocr_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def build_ocr_cache_key(image_path: Path, args: argparse.Namespace) -> str:
+    digest = hashlib.sha256()
+    digest.update(image_path.read_bytes())
+    digest.update(f"|ocr_max_side={int(args.ocr_max_side)}".encode("utf-8"))
+    digest.update(f"|threads={int(args.ocr_cpu_threads)}".encode("utf-8"))
+    return digest.hexdigest()
+
+
+def load_cached_ocr(cache_dir: Path, cache_key: str) -> str | None:
+    cache_path = cache_dir / f"{cache_key}.txt"
+    if not cache_path.exists():
+        return None
+    try:
+        return cache_path.read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def save_cached_ocr(cache_dir: Path, cache_key: str, text: str) -> None:
+    if not text:
+        return
+    cache_path = cache_dir / f"{cache_key}.txt"
+    cache_path.write_text(text, encoding="utf-8")
+
+
+def build_download_futures(
+    note_data: NoteData,
+    image_dir: Path,
+    args: argparse.Namespace,
+) -> tuple[ThreadPoolExecutor | None, dict[int, tuple[Path, Future[None]]]]:
+    total_images = count_image_blocks(note_data)
+    worker_count = max(1, min(int(args.download_workers), total_images))
+    if worker_count <= 1:
+        return None, {}
+
+    executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="xhs-download")
+    futures: dict[int, tuple[Path, Future[None]]] = {}
+    image_counter = 0
+
+    for block in note_data.blocks:
+        if block.get("type") != "image":
+            continue
+        image_counter += 1
+        image_url = (block.get("src") or "").strip()
+        if not image_url:
+            continue
+        image_path = image_dir / f"image_{image_counter:03d}.jpg"
+        future = executor.submit(
+            download_image,
+            image_url,
+            image_path,
+            args.timeout_sec,
+            args.max_retries,
+        )
+        futures[image_counter] = (image_path, future)
+
+    return executor, futures
+
+
 def render_note_content(
     note_data: NoteData,
     media_info: dict[str, Any],
@@ -936,78 +1102,104 @@ def render_note_content(
     image_counter = 0
     total_images = count_image_blocks(note_data)
     deferred_first_image: list[str] | None = None
+    download_executor, download_futures = build_download_futures(note_data, image_dir, args)
+    ocr_cache_dir = ensure_ocr_cache_dir(txt_path.parent)
 
-    for block in note_data.blocks:
-        block_type = block.get("type")
+    try:
+        for block in note_data.blocks:
+            block_type = block.get("type")
 
-        if block_type == "text":
-            content = (block.get("text") or "").strip()
-            if content:
-                indented = indent_paragraphs(content)
-                body_segments.append(indented)
-                existing_text_for_dedupe += "\n" + indented
-            continue
-
-        if block_type != "image":
-            continue
-
-        image_counter += 1
-        image_url = (block.get("src") or "").strip()
-        if not image_url:
-            line = f"[图片{image_counter} OCR失败：empty image url]"
-            if image_counter == 1 and total_images > 1:
-                deferred_first_image = [line]
-            else:
-                body_segments.append(line)
-                existing_text_for_dedupe += "\n" + line
-            continue
-
-        image_path = image_dir / f"image_{image_counter:03d}.jpg"
-
-        try:
-            log(f"OCR processing image {image_counter} ...")
-            download_image(image_url, image_path, timeout_sec=args.timeout_sec, max_retries=args.max_retries)
-            if ocr_engine is None:
-                ocr_engine = paddle_ocr_cls(
-                    lang="ch",
-                    ocr_version="PP-OCRv4",
-                    use_doc_orientation_classify=False,
-                    use_doc_unwarping=False,
-                    use_textline_orientation=False,
-                    text_det_limit_side_len=960,
-                    text_recognition_batch_size=6,
-                )
-
-            ocr_input = prepare_image_for_ocr(image_path, max_side=1280)
-            ocr_text = run_ocr(ocr_engine, ocr_input)
-            if ocr_input != image_path and ocr_input.exists():
-                ocr_input.unlink(missing_ok=True)
-            if not ocr_text:
-                raise RuntimeError("OCR empty result")
-
-            if is_duplicate_ocr_block(ocr_text, existing_text_for_dedupe):
+            if block_type == "text":
+                content = (block.get("text") or "").strip()
+                if content:
+                    indented = indent_paragraphs(content)
+                    body_segments.append(indented)
+                    existing_text_for_dedupe += "\n" + indented
                 continue
 
-            if image_counter == 1 and total_images > 1:
-                deferred_first_image = [ocr_text]
-            else:
-                indented_ocr = indent_paragraphs(ocr_text)
-                body_segments.append(indented_ocr)
-                existing_text_for_dedupe += "\n" + indented_ocr
-        except Exception as exc:  # noqa: BLE001
-            error_text = str(exc)
-            line = f"[图片{image_counter} OCR失败：{error_text}]"
-            if image_counter == 1 and total_images > 1:
-                deferred_first_image = [line]
-            else:
-                body_segments.append(line)
-                existing_text_for_dedupe += "\n" + line
+            if block_type != "image":
+                continue
 
-    if deferred_first_image:
-        if not is_duplicate_ocr_block("\n".join(deferred_first_image), existing_text_for_dedupe):
-            indented_deferred = [indent_paragraphs(x) for x in deferred_first_image]
-            body_segments.extend(indented_deferred)
-            existing_text_for_dedupe += "\n" + "\n".join(indented_deferred)
+            image_counter += 1
+            image_url = (block.get("src") or "").strip()
+            if not image_url:
+                line = f"[图片{image_counter} OCR失败：empty image url]"
+                if image_counter == 1 and total_images > 1:
+                    deferred_first_image = [line]
+                else:
+                    body_segments.append(line)
+                    existing_text_for_dedupe += "\n" + line
+                continue
+
+            image_path = image_dir / f"image_{image_counter:03d}.jpg"
+
+            try:
+                log(f"OCR processing image {image_counter} ...")
+                download_started = time.perf_counter()
+                future_entry = download_futures.get(image_counter)
+                if future_entry is None:
+                    download_image(image_url, image_path, timeout_sec=args.timeout_sec, max_retries=args.max_retries)
+                else:
+                    future_entry[1].result()
+                download_elapsed = time.perf_counter() - download_started
+
+                if ocr_engine is None:
+                    ocr_engine = paddle_ocr_cls(
+                        lang="ch",
+                        ocr_version="PP-OCRv4",
+                        use_doc_orientation_classify=False,
+                        use_doc_unwarping=False,
+                        use_textline_orientation=False,
+                        text_det_limit_side_len=min(960, int(args.ocr_max_side)),
+                        text_recognition_batch_size=6,
+                        cpu_threads=int(args.ocr_cpu_threads),
+                        enable_mkldnn=True,
+                    )
+
+                ocr_started = time.perf_counter()
+                ocr_input = prepare_image_for_ocr(image_path, max_side=int(args.ocr_max_side))
+                cache_key = build_ocr_cache_key(ocr_input, args)
+                ocr_text = None if args.disable_ocr_cache else load_cached_ocr(ocr_cache_dir, cache_key)
+                if ocr_text is None:
+                    ocr_text = run_ocr(ocr_engine, ocr_input)
+                    if not args.disable_ocr_cache and ocr_text:
+                        save_cached_ocr(ocr_cache_dir, cache_key, ocr_text)
+                else:
+                    log(f"Image {image_counter}: OCR cache hit")
+                ocr_elapsed = time.perf_counter() - ocr_started
+                if ocr_input != image_path and ocr_input.exists():
+                    ocr_input.unlink(missing_ok=True)
+                log(f"Image {image_counter}: download {download_elapsed:.2f}s, ocr {ocr_elapsed:.2f}s")
+
+                if not ocr_text:
+                    raise RuntimeError("OCR empty result")
+
+                if is_duplicate_ocr_block(ocr_text, existing_text_for_dedupe):
+                    continue
+
+                if image_counter == 1 and total_images > 1:
+                    deferred_first_image = [ocr_text]
+                else:
+                    indented_ocr = indent_paragraphs(ocr_text)
+                    body_segments.append(indented_ocr)
+                    existing_text_for_dedupe += "\n" + indented_ocr
+            except Exception as exc:  # noqa: BLE001
+                error_text = str(exc)
+                line = f"[图片{image_counter} OCR失败：{error_text}]"
+                if image_counter == 1 and total_images > 1:
+                    deferred_first_image = [line]
+                else:
+                    body_segments.append(line)
+                    existing_text_for_dedupe += "\n" + line
+
+        if deferred_first_image:
+            if not is_duplicate_ocr_block("\n".join(deferred_first_image), existing_text_for_dedupe):
+                indented_deferred = [indent_paragraphs(x) for x in deferred_first_image]
+                body_segments.extend(indented_deferred)
+                existing_text_for_dedupe += "\n" + "\n".join(indented_deferred)
+    finally:
+        if download_executor is not None:
+            download_executor.shutdown(wait=True, cancel_futures=False)
 
     header = note_data.title.strip()
     if note_data.author:
@@ -1024,12 +1216,11 @@ def render_note_content(
         file=sys.stderr,
     )
     return extracted_images, ocr_engine
-
-
 def main() -> int:
     args = parse_args()
     from paddleocr import PaddleOCR
-    url = normalize_url(args.url)
+    source_input = parse_source_input(args.source)
+    url = source_input.url
 
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1103,7 +1294,9 @@ def main() -> int:
             has_image_block = any(b.get("type") == "image" for b in note_data.blocks)
         if note_data.title in invalid_titles and not (has_text_block or has_image_block):
             raise RuntimeError("无效页面标题，跳过保存与OCR。")
-        output_stem = safe_filename(note_data.title, note_data.note_id)
+        if not args.skip_share_verify:
+            verify_share_hint_matches_note(source_input, note_data)
+        output_stem = build_output_stem(note_data.note_id)
         txt_path, image_dir = ensure_paths(out_dir, output_stem)
 
         extracted_images, _ocr_engine = render_note_content(
@@ -1125,7 +1318,7 @@ def main() -> int:
             with_retry(args.max_retries, _goto)
             wait_for_content(page, timeout_ms=min(5000, timeout_ms))
             note_data, media_info = collect_note_data(page, url, timeout_ms=timeout_ms)
-            output_stem = safe_filename(note_data.title, note_data.note_id)
+            output_stem = build_output_stem(note_data.note_id)
             txt_path, image_dir = ensure_paths(out_dir, output_stem)
             extracted_images, _ocr_engine = render_note_content(
                 note_data=note_data,
