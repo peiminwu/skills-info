@@ -816,8 +816,23 @@ def download_image(url: str, target: Path, timeout_sec: int, max_retries: int) -
         resp = requests.get(url, headers=headers, timeout=timeout_sec)
         resp.raise_for_status()
         target.write_bytes(resp.content)
+        sanitize_image_for_ocr(target)
 
     with_retry(max_retries, _do_request)
+
+
+def sanitize_image_for_ocr(image_path: Path) -> None:
+    """Rewrite cached images as clean JPEGs without source EXIF/TIFF metadata."""
+    try:
+        with Image.open(image_path) as img:
+            if img.mode not in {"RGB", "L"}:
+                img = img.convert("RGB")
+            elif img.mode == "L":
+                img = img.convert("RGB")
+            img.save(image_path, format="JPEG", quality=92, optimize=True)
+    except Exception:  # noqa: BLE001
+        # Keep original bytes if Pillow cannot decode a specific source image.
+        return
 
 
 def run_ocr(ocr_engine: Any, image_path: Path) -> str:
