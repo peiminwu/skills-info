@@ -15,6 +15,7 @@ from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 from PIL import Image
@@ -186,6 +187,19 @@ def clean_title(raw_title: str) -> str:
 
 def parse_comma_separated_items(raw_value: str) -> list[str]:
     return [item.strip() for item in str(raw_value or "").split(",") if item.strip()]
+
+
+def image_url_compare_key(raw_url: str) -> str:
+    url = (raw_url or "").strip()
+    if not url:
+        return ""
+    if url.startswith("//"):
+        url = "https:" + url
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return url
+    return f"{parts.scheme}://{parts.netloc}{parts.path}"
 
 
 def build_output_stem(note_id: str, title: str = "") -> str:
@@ -626,8 +640,9 @@ def dedupe_keep_order(items: list[str]) -> list[str]:
             continue
         if item.startswith("//"):
             item = "https:" + item
-        if item not in seen:
-            seen.add(item)
+        compare_key = image_url_compare_key(item)
+        if compare_key not in seen:
+            seen.add(compare_key)
             output.append(item)
     return output
 
@@ -1035,8 +1050,14 @@ def is_duplicate_ocr_block(ocr_text: str, existing_text: str) -> bool:
     if not ocr_norm or not existing_norm:
         return False
     # Quick containment check first.
-    if len(ocr_norm) >= 80 and ocr_norm in existing_norm:
+    if len(ocr_norm) >= 40 and ocr_norm in existing_norm:
         return True
+    if len(ocr_norm) >= 40:
+        longest = SequenceMatcher(None, ocr_norm[:4000], existing_norm[:4000]).find_longest_match(
+            0, min(len(ocr_norm), 4000), 0, min(len(existing_norm), 4000)
+        ).size
+        if longest >= 40 and (longest / max(1, len(ocr_norm))) >= 0.72:
+            return True
     # Fuzzy check for near-duplicate long blocks.
     if len(ocr_norm) >= 120:
         ratio = SequenceMatcher(None, ocr_norm[:4000], existing_norm[:4000]).ratio()
@@ -1139,7 +1160,10 @@ def render_note_content(
     build_ocr_engine: Any,
 ) -> tuple[int, Any]:
     body_segments: list[str] = []
-    existing_text_for_dedupe = ""
+    header_segments = [note_data.title.strip()]
+    if note_data.author:
+        header_segments.append(f"作者:{note_data.author.strip()}")
+    existing_text_for_dedupe = "\n".join(segment for segment in header_segments if segment)
 
     ocr_engine: Any | None = None
     image_counter = 0
