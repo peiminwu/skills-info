@@ -1,0 +1,5 @@
+version: 1
+interface:
+  display_name: XHS Content Extractor For Mac
+  short_description: macOS 专用，抓取小红书图文并用 Apple Vision 输出含图片OCR的TXT
+  default_prompt: 输入一个小红书图文链接，抓取正文并将每张图片通过 Apple Vision OCR 后按原顺序输出为 txt。
