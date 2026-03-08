@@ -1,0 +1,5 @@
+version: 1
+interface:
+  display_name: Reabble
+  short_description: macOS 上通过 Reabble 页面把本地 txt 发送到 Kindle
+  default_prompt: 输入一个或多个本地 txt 路径，发送到kindle。
