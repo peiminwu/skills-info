@@ -1,6 +1,6 @@
 ---
 name: xhs-content-extractor-for-mac
-description: macOS 专用小红书图文提取器，使用 Safari 登录态和 Apple Vision OCR 按原帖顺序输出 TXT（小红书链接抓取 / Apple Vision OCR / xhs note extract / for mac）。
+description: macOS 专用小红书图文提取器，使用 Safari 登录态和 Apple Vision OCR 按原帖顺序输出 TXT；生成后继续追问是否发送到kindle，或把本次/上次生成的 TXT 合并成合集后发送到kindle（小红书链接抓取 / Apple Vision OCR / xhs note extract / for mac）。
 ---
 
 # XHS Content Extractor For Mac
@@ -16,6 +16,7 @@ description: macOS 专用小红书图文提取器，使用 Safari 登录态和 A
 6. 若输入的是整段分享文案，会在 OCR 前先校验“分享预览”和实际页面是否一致，不一致直接停止，避免白跑 OCR。
 7. 默认启用 OCR 缓存；相同图片再次跑时会直接复用识别结果。
 8. 图片 OCR 使用 Apple Vision，仅支持 macOS。
+9. 成功生成 `txt` 后，继续追问后续 Kindle 动作，而不是直接结束。
 
 ## Scope
 
@@ -39,6 +40,7 @@ description: macOS 专用小红书图文提取器，使用 Safari 登录态和 A
 5. 终端输出包含图片检测摘要，方便排查“原帖有图但未提取”的情况
 6. 若检测到页面候选图片明显多于实际提取图片，会自动重跑整条笔记
 7. OCR 引擎固定为 Apple Vision，不依赖 Paddle 模型下载
+8. 如果同一轮生成了多个 `txt`，把这些路径视为“本次生成的 txt 列表”
 
 ## How to run
 
@@ -75,6 +77,29 @@ python scripts/fetch_xhs_note.py "【标题】摘要... http://xhslink.com/xxx C
 输出格式细节见：`references/output-format.md`
 问题排查见：`references/troubleshooting.md`
 
+## Post-generation follow-up
+
+每次成功生成 `txt` 后，都继续补充追问这两句：
+
+1. `是否把 txt 一个一个发送到kindle？`
+2. `是否把上次生成的 txt 合并成合集，推送到kindle？`
+
+执行规则：
+1. 如果用户选第 1 项，调用 [reabble](/Users/m4/Documents/codex/skills-info/reabble/SKILL.md) 把当前批次生成的每个 `txt` 逐个发送到 Kindle。
+2. 如果用户选第 2 项，优先使用当前轮刚生成的 `txt`；如果用户明确说“上次生成的 txt”，则使用上一批刚生成的 `txt` 路径。
+3. 合集发送前，先用 `scripts/merge_txt_collection.py` 合并成一个新的 `txt`，再调用 [reabble](/Users/m4/Documents/codex/skills-info/reabble/SKILL.md) 发送这个合集文件。
+4. 如果当前轮只生成了 1 个 `txt`，第 2 项仍可用，但应提醒用户合集其实只有 1 篇。
+5. 如果用户两个都不选，停在导出结果，不主动发送到 Kindle。
+
+合集合并示例：
+
+```bash
+python scripts/merge_txt_collection.py \
+  "outputs/A.txt" "outputs/B.txt" \
+  --output "outputs/A_B_合集.txt" \
+  --title "A B 合集"
+```
+
 ## Execution workflow
 
 1. 启动 Safari 自动化会话并复用当前 Safari 登录态。
@@ -82,6 +107,8 @@ python scripts/fetch_xhs_note.py "【标题】摘要... http://xhslink.com/xxx C
 3. 解析标题、正文块和图片顺序。
 4. 下载图片并执行 Apple Vision OCR。
 5. 生成 txt。
+6. 明确列出本次生成的 `txt` 路径。
+7. 紧接着追问用户是否逐个发送到 Kindle，或合并成合集后发送到 Kindle。
 
 ## Failure handling rules
 
