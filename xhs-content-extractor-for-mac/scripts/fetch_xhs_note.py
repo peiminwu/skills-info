@@ -26,7 +26,7 @@ DEFAULT_MAX_RETRIES = 3
 DEFAULT_TIMEOUT_SEC = 30
 DEFAULT_DOWNLOAD_WORKERS = 4
 DEFAULT_OCR_MAX_SIDE = 1280
-DEFAULT_VISION_RECOGNITION_LEVEL = "fast"
+DEFAULT_VISION_RECOGNITION_LEVEL = "accurate"
 DEFAULT_VISION_RECOGNITION_LANGUAGES = "zh-Hans,en-US"
 DEFAULT_VISION_MIN_TEXT_HEIGHT = 0.016
 
@@ -1410,7 +1410,8 @@ def main() -> int:
                 build_ocr_engine=build_ocr_engine,
             )
 
-        print(str(txt_path))
+        print(f"标题: {note_data.title}")
+        print(f"txt保存路径: {txt_path.parent}")
         return 0
 
     except Exception as exc:  # noqa: BLE001

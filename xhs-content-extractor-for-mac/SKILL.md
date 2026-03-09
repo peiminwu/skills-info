@@ -61,7 +61,7 @@ python scripts/fetch_xhs_note.py "【标题】摘要... http://xhslink.com/xxx C
 4. `--download-workers`（默认 `4`，图片下载并发数）
 5. `--ocr-max-side`（默认 `1280`，OCR 前图片长边缩放值；更小通常更快）
 6. `--skip-share-verify`（跳过 OCR 前分享文案校验，默认不开启）
-7. `--vision-recognition-level`（默认 `fast`，可选 `accurate`）
+7. `--vision-recognition-level`（默认 `accurate`，可选 `fast`）
 8. `--vision-recognition-languages`（默认 `zh-Hans,en-US`）
 9. `--vision-min-text-height`（默认 `0.016`，更大通常更快）
 10. `--vision-language-correction`（开启 Apple Vision 语言纠错）
@@ -72,7 +72,6 @@ python scripts/fetch_xhs_note.py "【标题】摘要... http://xhslink.com/xxx C
 
 1. `outputs/<笔记标题>.txt`
 2. `outputs/<笔记标题>/images/`（图片缓存）
-3. 若标题不可用，则回退为 `note_id`
 
 输出格式细节见：`references/output-format.md`
 问题排查见：`references/troubleshooting.md`
@@ -108,6 +107,7 @@ python scripts/merge_txt_collection.py \
 4. 下载图片并执行 Apple Vision OCR。
 5. 生成 txt。
 6. 明确列出本次生成的 `txt` 路径。
+6. 终端仅打印中文标题和 `txt` 保存目录路径，不打印具体文件名。
 7. 紧接着追问用户是否逐个发送到 Kindle，或合并成合集后发送到 Kindle。
 
 ## Failure handling rules
