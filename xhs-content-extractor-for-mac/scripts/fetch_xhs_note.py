@@ -27,8 +27,9 @@ DEFAULT_TIMEOUT_SEC = 30
 DEFAULT_DOWNLOAD_WORKERS = 4
 DEFAULT_OCR_MAX_SIDE = 1280
 DEFAULT_VISION_RECOGNITION_LEVEL = "accurate"
-DEFAULT_VISION_RECOGNITION_LANGUAGES = "zh-Hans,en-US"
-DEFAULT_VISION_MIN_TEXT_HEIGHT = 0.016
+DEFAULT_VISION_RECOGNITION_LANGUAGES = "zh-Hans"
+DEFAULT_VISION_MIN_TEXT_HEIGHT = 0.008
+DEFAULT_VISION_LANGUAGE_CORRECTION = True
 TXT_PARAGRAPH_INDENT = "　　"
 
 
@@ -90,23 +91,24 @@ def parse_args() -> argparse.Namespace:
         "--vision-recognition-level",
         choices=["fast", "accurate"],
         default=DEFAULT_VISION_RECOGNITION_LEVEL,
-        help="Apple Vision recognition level (default: fast)",
+        help="Apple Vision recognition level (default: accurate)",
     )
     parser.add_argument(
         "--vision-recognition-languages",
         default=DEFAULT_VISION_RECOGNITION_LANGUAGES,
-        help="Comma-separated BCP-47 languages for Vision OCR (default: zh-Hans,en-US)",
+        help="Comma-separated BCP-47 languages for Vision OCR (default: zh-Hans)",
     )
     parser.add_argument(
         "--vision-min-text-height",
         type=float,
         default=DEFAULT_VISION_MIN_TEXT_HEIGHT,
-        help="Minimum text height relative to image height for Vision OCR (default: 0.016)",
+        help="Minimum text height relative to image height for Vision OCR (default: 0.008)",
     )
     parser.add_argument(
         "--vision-language-correction",
-        action="store_true",
-        help="Enable Apple Vision language correction",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_VISION_LANGUAGE_CORRECTION,
+        help="Enable Apple Vision language correction (default: enabled)",
     )
     parser.add_argument(
         "--vision-auto-detect-language",
