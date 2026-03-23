@@ -29,6 +29,7 @@ DEFAULT_OCR_MAX_SIDE = 1280
 DEFAULT_VISION_RECOGNITION_LEVEL = "accurate"
 DEFAULT_VISION_RECOGNITION_LANGUAGES = "zh-Hans,en-US"
 DEFAULT_VISION_MIN_TEXT_HEIGHT = 0.016
+TXT_PARAGRAPH_INDENT = "　　"
 
 
 @dataclass
@@ -46,6 +47,20 @@ class SourceInput:
     raw_text: str
     url: str
     share_hint: str
+
+
+@dataclass
+class CollectionEntry:
+    note_id: str
+    title: str
+
+
+@dataclass
+class CollectionData:
+    collection_id: str
+    title: str
+    note_count: int
+    entries: list[CollectionEntry]
 
 
 def log(message: str) -> None:
@@ -178,11 +193,106 @@ def extract_note_id_if_present(url: str) -> str | None:
     return None
 
 
+def is_collection_url(url: str) -> bool:
+    return bool(re.search(r"/collection/item/([a-zA-Z0-9]+)", url))
+
+
+def extract_collection_id(url: str) -> str | None:
+    match = re.search(r"/collection/item/([a-zA-Z0-9]+)", url)
+    return match.group(1) if match else None
+
+
+def extract_initial_state_from_html(html: str) -> dict[str, Any]:
+    marker = "window.__INITIAL_STATE__="
+    start = html.find(marker)
+    if start < 0:
+        raise RuntimeError("合集页面未找到 INITIAL_STATE 数据。")
+
+    payload = html[start + len(marker):]
+    end = payload.find("</script>")
+    if end >= 0:
+        payload = payload[:end]
+    payload = payload.strip().rstrip(";").strip()
+    if not payload:
+        raise RuntimeError("合集页面 INITIAL_STATE 为空。")
+    # Xiaohongshu injects a JS object literal here, not strict JSON.
+    payload = re.sub(r":\s*undefined(?=[,}])", ": null", payload)
+    try:
+        return json.loads(payload)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("合集页面 INITIAL_STATE 解析失败。") from exc
+
+
+def fetch_collection_data(url: str, timeout_sec: int) -> CollectionData:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://www.xiaohongshu.com/",
+    }
+    resp = requests.get(url, headers=headers, timeout=timeout_sec)
+    resp.raise_for_status()
+    initial_state = extract_initial_state_from_html(resp.text)
+
+    note_data = (((initial_state.get("noteData") or {}).get("collectionData")) or {})
+    entries_raw = note_data.get("noteList") or []
+    entries: list[CollectionEntry] = []
+    for item in entries_raw:
+        if not isinstance(item, dict):
+            continue
+        note_id = str(item.get("id") or "").strip()
+        title = clean_title(str(item.get("title") or "").strip())
+        if not note_id:
+            continue
+        entries.append(CollectionEntry(note_id=note_id, title=title or note_id))
+
+    collection_id = str(note_data.get("id") or extract_collection_id(url) or "").strip()
+    title = clean_title(str(note_data.get("name") or "").strip()) or collection_id or "xhs_collection"
+    note_count = int(note_data.get("noteNum") or len(entries))
+
+    if not entries:
+        raise RuntimeError("合集页面没有解析到任何笔记条目。")
+
+    return CollectionData(
+        collection_id=collection_id or f"xhs_collection_{int(time.time())}",
+        title=title,
+        note_count=note_count,
+        entries=entries,
+    )
+
+
+def merge_collection_entries(*groups: list[CollectionEntry]) -> list[CollectionEntry]:
+    merged: list[CollectionEntry] = []
+    seen: set[str] = set()
+    for entries in groups:
+        for entry in entries:
+            note_id = str(entry.note_id or "").strip()
+            if not note_id or note_id in seen:
+                continue
+            seen.add(note_id)
+            merged.append(CollectionEntry(note_id=note_id, title=clean_title(entry.title) or note_id))
+    return merged
+
+
 def clean_title(raw_title: str) -> str:
     title = (raw_title or "").strip()
     # Remove Xiaohongshu site suffix from browser title.
     title = re.sub(r"\s*-\s*小红书.*$", "", title).strip()
     return title
+
+
+def format_txt_paragraphs(text: str) -> list[str]:
+    lines: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("[图片") and line.endswith("]"):
+            lines.append(line)
+        else:
+            lines.append(f"{TXT_PARAGRAPH_INDENT}{line}")
+    return lines
 
 
 def parse_comma_separated_items(raw_value: str) -> list[str]:
@@ -401,6 +511,162 @@ def hide_safari_ui() -> None:
             subprocess.run(["osascript", "-e", script], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
+
+
+def evaluate_async(page: Any, script: str, timeout_ms: int) -> Any:
+    ticket = page.evaluate(
+        f"""
+        () => {{
+            const ticket = "__codex_async_" + Math.random().toString(36).slice(2);
+            window[ticket] = {{ status: "pending" }};
+            Promise.resolve()
+                .then(() => ({script})())
+                .then(
+                    (value) => {{
+                        window[ticket] = {{ status: "fulfilled", value: value === undefined ? null : value }};
+                    }},
+                    (error) => {{
+                        const message = error && error.message ? error.message : String(error);
+                        window[ticket] = {{ status: "rejected", error: message }};
+                    }}
+                );
+            return ticket;
+        }}
+        """
+    )
+    deadline = time.time() + (timeout_ms / 1000)
+    while time.time() < deadline:
+        result = page.evaluate(f"() => window[{json.dumps(ticket)}] || null")
+        if isinstance(result, dict):
+            status = result.get("status")
+            if status == "fulfilled":
+                page.evaluate(f"() => {{ try {{ delete window[{json.dumps(ticket)}]; }} catch (_error) {{}}; return null; }}")
+                return result.get("value")
+            if status == "rejected":
+                page.evaluate(f"() => {{ try {{ delete window[{json.dumps(ticket)}]; }} catch (_error) {{}}; return null; }}")
+                raise RuntimeError(str(result.get("error") or "浏览器异步脚本执行失败。"))
+        time.sleep(0.2)
+    raise RuntimeError("浏览器异步脚本超时。")
+
+
+def fetch_collection_entries_via_browser(page: Any, collection_id: str, timeout_ms: int) -> CollectionData:
+    payload = evaluate_async(
+        page,
+        f"""
+        () => (async () => {{
+            const normalize = (item) => {{
+                if (!item || typeof item !== "object") {{
+                    return null;
+                }}
+                const noteId = String(item.id || item.noteId || "").trim();
+                const title = String(item.title || item.name || "").trim();
+                if (!noteId) {{
+                    return null;
+                }}
+                return {{ note_id: noteId, title }};
+            }};
+
+            const initial = (((window.__INITIAL_STATE__ || {{}}).noteData || {{}}).collectionData) || {{}};
+            let entries = Array.isArray(initial.noteList) ? initial.noteList.map(normalize).filter(Boolean) : [];
+            let noteCount = Number(initial.noteNum || entries.length || 0);
+            let title = String(initial.name || "").trim();
+
+            if (window.webpackChunkranchi) {{
+                try {{
+                    if (!window.__xhs_require__) {{
+                        window.webpackChunkranchi.push([[Symbol("codex")], {{}}, function(req) {{ window.__xhs_require__ = req; }}]);
+                    }}
+                    const req = window.__xhs_require__;
+                    const http = req && req(57180) && req(57180).LV;
+                    const apiHost = req && req(48607) && req(48607).pH ? req(48607).pH() : null;
+                    if (http && apiHost) {{
+                        const request = async (cursor) => {{
+                            const body = {{
+                                collectionId: {json.dumps(collection_id)},
+                                num: 20,
+                                source: "web",
+                                deviceOrientation: "portrait",
+                            }};
+                            if (cursor) {{
+                                body.cursor = cursor;
+                            }}
+                            return await http.post(
+                                "/api/sns/v1/note/collection/h5/list_note_v2",
+                                body,
+                                {{ transform: true, baseURL: apiHost, headers: {{ "Content-Type": "application/json;charset=UTF-8" }} }}
+                            );
+                        }};
+
+                        let cursor = null;
+                        let guard = 0;
+                        let combined = [];
+                        while (guard < 10) {{
+                            guard += 1;
+                            const pageData = await request(cursor);
+                            const pageItems = Array.isArray(pageData && pageData.items)
+                                ? pageData.items.map(normalize).filter(Boolean)
+                                : [];
+                            if (!pageItems.length) {{
+                                break;
+                            }}
+                            combined = combined.concat(pageItems);
+                            if (!(pageData && pageData.downHasMore && pageData.downCursor)) {{
+                                break;
+                            }}
+                            cursor = pageData.downCursor;
+                        }}
+                        if (combined.length > entries.length) {{
+                            entries = combined;
+                        }}
+                    }}
+                }} catch (_error) {{
+                }}
+            }}
+
+            return {{
+                collection_id: {json.dumps(collection_id)},
+                title,
+                note_count: noteCount,
+                entries,
+            }};
+        }})()
+        """,
+        timeout_ms=timeout_ms,
+    )
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("合集页面未返回有效数据。")
+
+    entries_raw = payload.get("entries")
+    if not isinstance(entries_raw, list):
+        entries_raw = []
+
+    entries: list[CollectionEntry] = []
+    for item in entries_raw:
+        if not isinstance(item, dict):
+            continue
+        note_id = str(item.get("note_id") or "").strip()
+        title = clean_title(str(item.get("title") or "").strip())
+        if not note_id:
+            continue
+        entries.append(CollectionEntry(note_id=note_id, title=title or note_id))
+
+    if not entries:
+        raise RuntimeError("合集页面浏览器上下文未解析到任何笔记条目。")
+
+    note_count = payload.get("note_count")
+    try:
+        parsed_note_count = int(note_count)
+    except Exception:
+        parsed_note_count = len(entries)
+
+    title = clean_title(str(payload.get("title") or "").strip()) or collection_id or "xhs_collection"
+    return CollectionData(
+        collection_id=str(payload.get("collection_id") or collection_id or f"xhs_collection_{int(time.time())}").strip(),
+        title=title,
+        note_count=max(parsed_note_count, len(entries)),
+        entries=entries,
+    )
 
 
 def with_retry(max_retries: int, fn: Any) -> Any:
@@ -1103,6 +1369,112 @@ def ensure_ocr_cache_dir(out_dir: Path) -> Path:
     return cache_dir
 
 
+def build_child_note_command(entry_url: str, args: argparse.Namespace) -> list[str]:
+    script_path = Path(__file__).resolve()
+    cmd = [sys.executable, str(script_path), entry_url]
+    cmd.extend(["--out-dir", str(Path(args.out_dir).resolve())])
+    cmd.extend(["--encoding", str(args.encoding)])
+    cmd.extend(["--max-retries", str(args.max_retries)])
+    cmd.extend(["--timeout-sec", str(args.timeout_sec)])
+    cmd.extend(["--download-workers", str(args.download_workers)])
+    cmd.extend(["--ocr-max-side", str(args.ocr_max_side)])
+    cmd.extend(["--vision-recognition-level", str(args.vision_recognition_level)])
+    cmd.extend(["--vision-recognition-languages", str(args.vision_recognition_languages)])
+    cmd.extend(["--vision-min-text-height", str(args.vision_min_text_height)])
+    cmd.append("--skip-share-verify")
+    if args.vision_language_correction:
+        cmd.append("--vision-language-correction")
+    if args.vision_auto_detect_language:
+        cmd.append("--vision-auto-detect-language")
+    if args.disable_ocr_cache:
+        cmd.append("--disable-ocr-cache")
+    if args.show_browser:
+        cmd.append("--show-browser")
+    if args.use_active_tab:
+        cmd.append("--use-active-tab")
+    return cmd
+
+
+def process_collection(source_input: SourceInput, args: argparse.Namespace) -> int:
+    collection = fetch_collection_data(source_input.url, timeout_sec=args.timeout_sec)
+    timeout_ms = int(args.timeout_sec * 1000)
+    log(
+        f"Detected collection: {collection.title} "
+        f"(HTML 显示 {collection.note_count} 篇，解析到 {len(collection.entries)} 篇)"
+    )
+
+    browser_collection: CollectionData | None = None
+    if len(collection.entries) < collection.note_count:
+        driver = None
+        page = None
+        try:
+            if args.use_active_tab:
+                driver, page = launch_active_safari_page(timeout_ms=timeout_ms)
+            else:
+                driver, page = launch_safari_page(timeout_ms=timeout_ms)
+                if not args.show_browser:
+                    hide_safari_ui()
+
+            page.goto(source_input.url, timeout_ms=timeout_ms)
+            page.wait_for_timeout(800)
+            page.wait_for_load_state("domcontentloaded", timeout_ms=timeout_ms)
+            browser_collection = fetch_collection_entries_via_browser(
+                page,
+                collection_id=collection.collection_id,
+                timeout_ms=timeout_ms,
+            )
+            merged_entries = merge_collection_entries(browser_collection.entries, collection.entries)
+            if len(merged_entries) > len(collection.entries):
+                collection = CollectionData(
+                    collection_id=browser_collection.collection_id or collection.collection_id,
+                    title=browser_collection.title or collection.title,
+                    note_count=max(browser_collection.note_count, collection.note_count, len(merged_entries)),
+                    entries=merged_entries,
+                )
+            log(
+                f"Browser collection fetch resolved {len(collection.entries)} / {collection.note_count} 篇"
+            )
+        except Exception as exc:  # noqa: BLE001
+            log(f"Collection browser fetch fallback: {exc}")
+        finally:
+            if driver is not None:
+                driver.quit()
+
+    output_paths: list[str] = []
+    failures: list[str] = []
+    for index, entry in enumerate(collection.entries, start=1):
+        note_url = f"https://www.xiaohongshu.com/explore/{entry.note_id}"
+        log(f"[合集 {index}/{len(collection.entries)}] {entry.title}")
+        proc = subprocess.run(
+            build_child_note_command(note_url, args),
+            capture_output=True,
+            text=True,
+        )
+        if proc.stderr:
+            sys.stderr.write(proc.stderr)
+        if proc.returncode != 0:
+            failures.append(f"{entry.title} ({entry.note_id})")
+            continue
+        child_stdout = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+        if child_stdout:
+            output_paths.append(child_stdout[-1])
+
+    if not output_paths and failures:
+        log("Error: 合集内所有笔记都抓取失败。")
+        return 1
+
+    for path in output_paths:
+        print(path)
+
+    if failures:
+        log(f"合集部分失败：{len(failures)} 篇未成功抓取。")
+        for item in failures:
+            log(f"- {item}")
+        return 2
+
+    return 0
+
+
 def build_ocr_cache_key(image_path: Path, args: argparse.Namespace) -> str:
     digest = hashlib.sha256()
     digest.update(image_path.read_bytes())
@@ -1270,11 +1642,16 @@ def render_note_content(
         if download_executor is not None:
             download_executor.shutdown(wait=True, cancel_futures=False)
 
-    header = note_data.title.strip()
+    content_lines = [note_data.title.strip()]
     if note_data.author:
-        header += "\n\n" + f"作者: {note_data.author}"
-    body = "".join(body_segments).strip()
-    content = (header + ("\n\n" + body if body else "")).strip() + "\n"
+        content_lines.append(f"作者: {note_data.author}")
+
+    body_lines: list[str] = []
+    for segment in body_segments:
+        body_lines.extend(format_txt_paragraphs(segment))
+    content_lines.extend(line for line in body_lines if line)
+
+    content = "\n".join(line for line in content_lines if line).strip() + "\n"
     txt_path.write_text(content, encoding=args.encoding)
 
     extracted_images = count_image_blocks(note_data)
@@ -1302,6 +1679,9 @@ def main() -> int:
 
     source_input = parse_source_input(args.source)
     url = source_input.url
+
+    if is_collection_url(url):
+        return process_collection(source_input, args)
 
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)

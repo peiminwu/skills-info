@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 import sys
 
+TXT_PARAGRAPH_INDENT = "　　"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Merge multiple TXT files into a single anthology TXT.")
@@ -39,22 +41,31 @@ def read_text(path: Path) -> str:
         return path.read_text(encoding="utf-8")
 
 
+def compact_text_block(text: str) -> str:
+    output_lines: list[str] = []
+    for index, raw_line in enumerate(str(text or "").splitlines()):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if index >= 2 and not line.startswith("[图片") and not line.startswith(TXT_PARAGRAPH_INDENT):
+            line = f"{TXT_PARAGRAPH_INDENT}{line}"
+        output_lines.append(line)
+    return "\n".join(output_lines).strip()
+
+
 def build_merged_text(inputs: list[Path], title: str) -> str:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    parts: list[str] = [title, f"生成时间：{timestamp}", "", "目录"]
+    parts: list[str] = [title, f"生成时间：{timestamp}", "目录"]
     for index, path in enumerate(inputs, start=1):
         parts.append(f"{index}. {path.stem}")
 
     for index, path in enumerate(inputs, start=1):
-        body = read_text(path).strip()
+        body = compact_text_block(read_text(path))
         parts.extend(
             [
-                "",
-                "",
                 "=" * 24,
                 f"第 {index} 篇｜{path.stem}",
                 "=" * 24,
-                "",
                 body,
             ]
         )
